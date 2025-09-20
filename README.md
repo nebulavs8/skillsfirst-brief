@@ -1,4 +1,4 @@
-# 🎈 Blank app template
+# Skills First Project
 
 A simple Streamlit app template for you to modify!
 
