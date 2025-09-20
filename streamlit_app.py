@@ -220,3 +220,18 @@ Timestamp: {datetime.now().isoformat()}
 
 else:
     st.info("Tip: Try with a school newsletter, IEP update, district announcement, or work RFP to see how it condenses.")
+# --- Ensure NLTK tokenizers are available (needed by Sumy)
+import nltk
+
+def _ensure_nltk():
+    for pkg, path in [
+        ("punkt", "tokenizers/punkt"),
+        # Newer NLTK also looks for this table; harmless if it doesn't exist
+        ("punkt_tab", "tokenizers/punkt_tab"),
+    ]:
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            nltk.download(pkg, quiet=True)
+
+_ensure_nltk()
