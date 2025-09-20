@@ -39,7 +39,7 @@ which while who who's whom why why's with won't would wouldn't you you'd you'll 
 """.split())
 
 def sentence_split(text: str):
-    # Crude but effective sentence splitter (no NLTK)
+    # Crude but effective sentence splitter
     # Split on . ! ? followed by whitespace/newline; keep abbreviations together reasonably well
     sentences = re.split(r'(?<=[.!?])\s+', text.strip())
     # Clean
