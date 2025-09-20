@@ -1,4 +1,3 @@
-import os
 import re
 import io
 from datetime import datetime
@@ -7,38 +6,10 @@ from dateutil import parser as dateparser
 import streamlit as st
 from pypdf import PdfReader
 
-# ------------------ NLTK setup (robust) ------------------
-import nltk
-
-# Use a writable dir on Streamlit Cloud
-NLTK_DIR = "/tmp/nltk_data"
-os.makedirs(NLTK_DIR, exist_ok=True)
-if NLTK_DIR not in nltk.data.path:
-    nltk.data.path.append(NLTK_DIR)
-
-def _ensure_nltk():
-    """Ensure Sumy-required NLTK resources exist; download to /tmp/nltk_data."""
-    for pkg, path in [
-        ("punkt", "tokenizers/punkt"),
-        ("punkt_tab", "tokenizers/punkt_tab"),  # harmless if not needed
-        ("stopwords", "corpora/stopwords"),
-    ]:
-        try:
-            nltk.data.find(path)
-        except LookupError:
-            nltk.download(pkg, download_dir=NLTK_DIR, quiet=True)
-
-_ensure_nltk()
-
-# Defer Sumy imports until after tokenizer is ensured
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lex_rank import LexRankSummarizer
-
 APP_TITLE = "SchoolDoc AI — 1-Page Action Brief"
 BRAND_NOTE = "Skills-First Blueprint • Families • Teachers • Orgs"
 
-# ------------------ Helpers ------------------
+# ------------------ PDF/Text helpers ------------------
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(file_bytes))
     pages = []
@@ -55,57 +26,81 @@ def clean_text(txt: str) -> str:
     txt = re.sub(r"[ \t]{2,}", " ", txt)
     return txt
 
-# --------- Fallback summarizer (no NLTK needed) ----------
-def fallback_summarize(text: str, max_sentences: int = 5) -> str:
+# ------------------ Simple extractive summarizer ------------------
+STOPWORDS = set("""
+a about above after again against all am an and any are aren't as at be because been before being below between
+both but by can't cannot could couldn't did didn't do does doesn't doing don't down during each few for from further
+had hadn't has hasn't have haven't having he he'd he'll he's her here here's hers herself him himself his how how's i
+i'd i'll i'm i've if in into is isn't it it's its itself let's me more most mustn't my myself no nor not of off on
+once only or other ought our ours ourselves out over own same shan't she she'd she'll she's should shouldn't so some
+such than that that's the their theirs them themselves then there there's these they they'd they'll they're they've this those
+through to too under until up very was wasn't we we'd we'll we're we've were weren't what what's when when's where where's
+which while who who's whom why why's with won't would wouldn't you you'd you'll you're you've your yours yourself yourselves
+""".split())
+
+def sentence_split(text: str):
+    # Crude but effective sentence splitter (no NLTK)
+    # Split on . ! ? followed by whitespace/newline; keep abbreviations together reasonably well
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    # Clean
+    sentences = [s.strip() for s in sentences if s.strip()]
+    return sentences
+
+def word_tokens(text: str):
+    return [w.lower() for w in re.findall(r"[A-Za-z']+", text)]
+
+def summarize_text(text: str, max_sentences: int = 5) -> str:
     """
-    Simple extractive fallback:
-    - Split into sentences by punctuation
-    - Score sentences by length + keyword density
-    - Return top N in original order
+    Frequency-based extractive summary:
+    - Split into sentences
+    - Build word frequencies (ignore stopwords)
+    - Score sentences by normalized word freq sum, penalize very short/very long
+    - Return top-N sentences in original order
     """
-    if not text:
+    sents = sentence_split(text)
+    if not sents:
         return ""
-    # crude sentence split
-    sents = re.split(r'(?<=[\.\!\?])\s+', text)
-    # keywords to weight (tune if you like)
-    kw = ["deadline", "must", "require", "submit", "date", "schedule", "program", "workshop", "policy"]
-    scores = []
-    for i, s in enumerate(sents):
-        length_score = min(len(s) / 200.0, 1.0)
-        kw_score = sum(s.lower().count(k) for k in kw) / 3.0
-        scores.append((i, s, length_score + kw_score))
-    # pick top by score, then restore original order
-    top = sorted(scores, key=lambda x: x[2], reverse=True)[:max_sentences]
+
+    words = word_tokens(text)
+    if not words:
+        return " "
+
+    # term frequencies
+    freq = {}
+    for w in words:
+        if w in STOPWORDS or len(w) <= 2:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+
+    if not freq:
+        # fallback: just take first N sentences
+        return " ".join(sents[:max_sentences])
+
+    max_f = max(freq.values())
+    for w in list(freq.keys()):
+        freq[w] = freq[w] / max_f
+
+    # sentence scores
+    scored = []
+    for idx, s in enumerate(sents):
+        tokens = word_tokens(s)
+        if not tokens:
+            continue
+        # base score: sum of token frequencies
+        score = sum(freq.get(t, 0) for t in tokens)
+        # length regularization (prefer ~12-35 words)
+        length = max(1, len(tokens))
+        ideal = 24
+        length_penalty = 1.0 - min(0.6, abs(length - ideal) / float(ideal + 1))
+        score *= (0.4 + 0.6 * length_penalty)
+        scored.append((idx, s, score))
+
+    # pick top sentences by score
+    top = sorted(scored, key=lambda x: x[2], reverse=True)[:max_sentences]
     top_sorted = [t[1] for t in sorted(top, key=lambda x: x[0])]
     return " ".join(top_sorted).strip()
 
-def summarize_lexrank(text: str, sentences: int = 6) -> str:
-    """Primary summarizer: Sumy LexRank; falls back gracefully without NLTK."""
-    text = text.strip()
-    if not text:
-        return ""
-    max_chars = 8000
-    chunks = [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
-    summarizer = LexRankSummarizer()
-    summaries = []
-    for chunk in chunks:
-        try:
-            parser = PlaintextParser.from_string(chunk, Tokenizer("english"))
-            sents = summarizer(parser.document, sentences)
-            summaries.append(" ".join([str(s) for s in sents]))
-        except LookupError:
-            # If punkt/stopwords still missing for any reason, use fallback
-            summaries.append(fallback_summarize(chunk, max_sentences=sentences))
-    merged = " ".join(summaries)
-    if len(chunks) > 1:
-        try:
-            parser2 = PlaintextParser.from_string(merged, Tokenizer("english"))
-            sents2 = summarizer(parser2.document, min(sentences, 7))
-            return " ".join([str(s) for s in sents2])
-        except LookupError:
-            return fallback_summarize(merged, max_sentences=min(sentences, 7))
-    return merged
-
+# ------------------ Info extraction ------------------
 def find_deadlines(text: str):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     hit_lines = [l for l in lines if re.search(r"\b(deadline|due|submit by|no later than)\b", l, re.I)]
@@ -130,7 +125,7 @@ def find_requirements(text: str):
         if not l_clean:
             continue
         if re.match(r"^(\*|-|•|\d+\.)\s+", l_clean) or len(l_clean) < 220:
-            if re.search(r"\b(must|required?|need to|provide|eligib|documentation|proof)\b", l_clean, re.I):
+            if re.search(r"\b(must|required?|need to|provide|eligib|documentation|proof|return)\b", l_clean, re.I):
                 req_lines.append(re.sub(r"^(\*|-|•|\d+\.)\s*", "", l_clean))
     seen = set()
     out = []
@@ -176,7 +171,7 @@ def propose_next_steps(reqs, deadlines):
     return final[:5]
 
 def make_brief(text: str):
-    exec_summary = summarize_lexrank(text, sentences=5)
+    exec_summary = summarize_text(text, max_sentences=5)
     key_points = find_key_points(text, top_n=6)
     deadline_lines, parsed_dates = find_deadlines(text)
     requirements = find_requirements(text)
@@ -217,6 +212,7 @@ uploaded = st.file_uploader("Upload document", type=["pdf", "txt"])
 with_styling = st.toggle("Use condensed layout", value=True)
 
 if uploaded:
+    # Read file
     if uploaded.type == "application/pdf" or uploaded.name.lower().endswith(".pdf"):
         raw = uploaded.read()
         text = extract_text_from_pdf(raw)
@@ -224,6 +220,7 @@ if uploaded:
         text = uploaded.read().decode("utf-8", errors="ignore")
     text = clean_text(text)
 
+    # Friendly warning for scanned/short docs
     if not text or len(text.strip()) < 200:
         st.warning("This file looks very short or may be a scanned PDF with no selectable text. Try a text-based PDF or TXT file for best results.")
 
@@ -232,6 +229,7 @@ if uploaded:
             brief = make_brief(text)
             md = brief_to_markdown(brief, uploaded.name)
 
+        # Styled render
         if with_styling:
             st.markdown(
                 """
@@ -248,6 +246,7 @@ if uploaded:
         else:
             st.markdown(md)
 
+        # Downloads
         st.download_button(
             "⬇️ Download Brief (Markdown)",
             data=md.encode("utf-8"),
@@ -257,7 +256,7 @@ if uploaded:
 
         receipt = f"""Receipt: Family-Receipt-AI-Summarization
 Source: {uploaded.name}
-Skills: Summarization (LexRank + fallback), Heuristic extraction (deadlines/requirements), Stakeholder translation
+Skills: Extractive summarization (freq-based), Heuristic extraction (deadlines/requirements), Stakeholder translation
 Timestamp: {datetime.now().isoformat()}
 """
         st.download_button(
@@ -268,3 +267,4 @@ Timestamp: {datetime.now().isoformat()}
         )
 else:
     st.info("Tip: Try a school newsletter, IEP update, district announcement, or work RFP to see how it condenses.")
+
