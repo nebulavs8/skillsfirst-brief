@@ -6,6 +6,19 @@ from dateutil import parser as dateparser
 import streamlit as st
 from pypdf import PdfReader
 
+# --- Ensure NLTK tokenizers are available (needed by Sumy)
+import nltk
+def _ensure_nltk():
+    for pkg, path in [
+        ("punkt", "tokenizers/punkt"),
+        ("punkt_tab", "tokenizers/punkt_tab"),  # harmless if absent on some NLTK versions
+    ]:
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            nltk.download(pkg, quiet=True)
+_ensure_nltk()
+
 # --- Sumy (lightweight summarization)
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
@@ -27,13 +40,12 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def clean_text(txt: str) -> str:
     txt = txt.replace("\x00", " ").strip()
-    # Collapse excessive whitespace
-    txt = re.sub(r"\n{3,}", "\n\n", txt)
-    txt = re.sub(r"[ \t]{2,}", " ", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)         # collapse tall newlines
+    txt = re.sub(r"[ \t]{2,}", " ", txt)         # collapse extra spaces/tabs
     return txt
 
 def summarize_lexrank(text: str, sentences: int = 6) -> str:
-    # Sumy prefers <= ~8k-10k chars; chunk if very long
+    """Free, local summarization with Sumy LexRank, with NLTK retry protection."""
     text = text.strip()
     if not text:
         return ""
@@ -42,10 +54,13 @@ def summarize_lexrank(text: str, sentences: int = 6) -> str:
     summarizer = LexRankSummarizer()
     summaries = []
     for chunk in chunks:
-        parser = PlaintextParser.from_string(chunk, Tokenizer("english"))
+        try:
+            parser = PlaintextParser.from_string(chunk, Tokenizer("english"))
+        except LookupError:
+            _ensure_nltk()
+            parser = PlaintextParser.from_string(chunk, Tokenizer("english"))
         sents = summarizer(parser.document, sentences)
         summaries.append(" ".join([str(s) for s in sents]))
-    # second-pass compress
     merged = " ".join(summaries)
     if len(chunks) > 1:
         parser2 = PlaintextParser.from_string(merged, Tokenizer("english"))
@@ -54,11 +69,13 @@ def summarize_lexrank(text: str, sentences: int = 6) -> str:
     return merged
 
 def find_deadlines(text: str):
-    # Grab lines with deadline-ish words + parse dates if present
+    # Lines that look like deadlines + parse explicit dates
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     hit_lines = [l for l in lines if re.search(r"\b(deadline|due|submit by|no later than)\b", l, re.I)]
-    # Also find date patterns
-    date_hits = re.findall(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b", text)
+    date_hits = re.findall(
+        r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b",
+        text,
+    )
     parsed_dates = []
     for d in date_hits:
         try:
@@ -70,7 +87,7 @@ def find_deadlines(text: str):
     return hit_lines, pretty
 
 def find_requirements(text: str):
-    # Heuristics: capture bullet/numbered lines with must/require/need/provide/eligibility
+    # Heuristics: short bullet/number lines with must/require/need/provide/eligibility
     req_lines = []
     for l in text.splitlines():
         l_clean = l.strip()
@@ -79,7 +96,7 @@ def find_requirements(text: str):
         if re.match(r"^(\*|-|•|\d+\.)\s+", l_clean) or len(l_clean) < 220:
             if re.search(r"\b(must|required?|need to|provide|eligib|documentation|proof)\b", l_clean, re.I):
                 req_lines.append(re.sub(r"^(\*|-|•|\d+\.)\s*", "", l_clean))
-    # Deduplicate while preserving order
+    # Deduplicate preserve-order
     seen = set()
     out = []
     for x in req_lines:
@@ -90,13 +107,12 @@ def find_requirements(text: str):
     return out[:10]
 
 def find_key_points(text: str, top_n: int = 6):
-    # Shallow: take short, informative lines (titles/subheads/bullets)
+    # Grab medium-length lines that read like headings/points
     candidates = []
     for l in text.splitlines():
         l = l.strip(" -•*\t")
-        if 40 <= len(l) <= 220:
-            if not l.endswith(":"):
-                candidates.append(l)
+        if 40 <= len(l) <= 220 and not l.endswith(":"):
+            candidates.append(l)
     # Deduplicate
     seen = set()
     out = []
@@ -114,7 +130,7 @@ def propose_next_steps(reqs, deadlines):
     if reqs:
         steps.append("Gather required documents/items listed above and upload 48 hours before the deadline.")
     steps.extend([
-        "Email teacher/admin with any clarifying questions (keep it to 3 bullets).",
+        "Email teacher/admin with any clarifying questions (limit to 3 bullets).",
         "Confirm submission method (portal, email, or printed copy) and save the confirmation.",
         "Schedule a 15-minute review with your child/team to align on what success looks like."
     ])
@@ -148,9 +164,11 @@ def brief_to_markdown(brief: dict, source_name: str):
         md.append(f"## {section}")
         val = brief.get(section, "")
         if isinstance(val, list):
-            if not val: md.append("_None found._")
-            for v in val:
-                md.append(f"- {v}")
+            if not val:
+                md.append("_None found._")
+            else:
+                for v in val:
+                    md.append(f"- {v}")
         else:
             md.append(val if val else "_None found._")
         md.append("")
@@ -161,13 +179,15 @@ def brief_to_markdown(brief: dict, source_name: str):
 st.set_page_config(page_title=APP_TITLE, page_icon="📝", layout="centered")
 st.title(APP_TITLE)
 st.caption(BRAND_NOTE)
-
-st.write("Upload a school/work **PDF** or **TXT**. You’ll get a 1-page brief with the main points, deadlines, requirements, and clear next steps.")
+st.write(
+    "Upload a school/work **PDF** or **TXT**. You’ll get a 1-page brief with the main points, deadlines, requirements, and clear next steps."
+)
 
 uploaded = st.file_uploader("Upload document", type=["pdf", "txt"])
 with_styling = st.toggle("Use condensed layout", value=True)
 
 if uploaded:
+    # Read file
     if uploaded.type == "application/pdf" or uploaded.name.lower().endswith(".pdf"):
         raw = uploaded.read()
         text = extract_text_from_pdf(raw)
@@ -175,13 +195,25 @@ if uploaded:
         text = uploaded.read().decode("utf-8", errors="ignore")
     text = clean_text(text)
 
-    if not text or len(text) < 400:
-        st.warning("The document looks very short. You can still generate a brief, but results may be minimal.")
+    # Friendly warnings for short/scanned docs
+    if not text or len(text.strip()) < 200:
+        st.warning(
+            "This file looks very short or may be a scanned PDF with no selectable text. "
+            "Try a text-based PDF or TXT file for best results."
+        )
+
     if st.button("Generate 1-Page Brief"):
         with st.spinner("Summarizing…"):
-            brief = make_brief(text)
-            md = brief_to_markdown(brief, uploaded.name)
+            try:
+                brief = make_brief(text)
+                md = brief_to_markdown(brief, uploaded.name)
+            except LookupError:
+                # Safety net: ensure NLTK and retry once
+                _ensure_nltk()
+                brief = make_brief(text)
+                md = brief_to_markdown(brief, uploaded.name)
 
+        # Styled render
         if with_styling:
             st.markdown(
                 """
@@ -198,6 +230,7 @@ if uploaded:
         else:
             st.markdown(md)
 
+        # Downloads
         st.download_button(
             "⬇️ Download Brief (Markdown)",
             data=md.encode("utf-8"),
@@ -205,7 +238,6 @@ if uploaded:
             mime="text/markdown"
         )
 
-        # Mini “receipt” for your Skills-First system
         receipt = f"""Receipt: Family-Receipt-AI-Summarization
 Source: {uploaded.name}
 Skills: Summarization (LexRank), Heuristic extraction (deadlines/requirements), Stakeholder translation
@@ -217,21 +249,5 @@ Timestamp: {datetime.now().isoformat()}
             file_name=f"{uploaded.name.rsplit('.',1)[0]}_receipt.txt",
             mime="text/plain"
         )
-
 else:
-    st.info("Tip: Try with a school newsletter, IEP update, district announcement, or work RFP to see how it condenses.")
-# --- Ensure NLTK tokenizers are available (needed by Sumy)
-import nltk
-
-def _ensure_nltk():
-    for pkg, path in [
-        ("punkt", "tokenizers/punkt"),
-        # Newer NLTK also looks for this table; harmless if it doesn't exist
-        ("punkt_tab", "tokenizers/punkt_tab"),
-    ]:
-        try:
-            nltk.data.find(path)
-        except LookupError:
-            nltk.download(pkg, quiet=True)
-
-_ensure_nltk()
+    st.info("Tip: Try a school newsletter, IEP update, district announcement, or work RFP to see how it condenses.")
