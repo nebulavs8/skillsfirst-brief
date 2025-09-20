@@ -220,3 +220,8 @@ Timestamp: {datetime.now().isoformat()}
 
 else:
     st.info("Tip: Try with a school newsletter, IEP update, district announcement, or work RFP to see how it condenses.")
+streamlit==1.38.0
+pypdf==5.0.1
+sumy==0.11.0
+python-dateutil==2.9.0.post0
+nltk==3.9.1
