@@ -1,9 +1,11 @@
 import re
 import io
+import zipfile
 from datetime import datetime
 from dateutil import parser as dateparser
 
 import streamlit as st
+import pandas as pd
 from pypdf import PdfReader
 
 APP_TITLE = "SchoolDoc AI — 1-Page Action Brief"
@@ -39,63 +41,41 @@ which while who who's whom why why's with won't would wouldn't you you'd you'll 
 """.split())
 
 def sentence_split(text: str):
-    # Crude but effective sentence splitter
-    # Split on . ! ? followed by whitespace/newline; keep abbreviations together reasonably well
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    # Clean
-    sentences = [s.strip() for s in sentences if s.strip()]
-    return sentences
+    sents = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s.strip() for s in sents if s.strip()]
 
 def word_tokens(text: str):
     return [w.lower() for w in re.findall(r"[A-Za-z']+", text)]
 
 def summarize_text(text: str, max_sentences: int = 5) -> str:
-    """
-    Frequency-based extractive summary:
-    - Split into sentences
-    - Build word frequencies (ignore stopwords)
-    - Score sentences by normalized word freq sum, penalize very short/very long
-    - Return top-N sentences in original order
-    """
     sents = sentence_split(text)
     if not sents:
         return ""
-
     words = word_tokens(text)
     if not words:
         return " "
-
-    # term frequencies
+    # term freq
     freq = {}
     for w in words:
         if w in STOPWORDS or len(w) <= 2:
             continue
         freq[w] = freq.get(w, 0) + 1
-
     if not freq:
-        # fallback: just take first N sentences
         return " ".join(sents[:max_sentences])
-
-    max_f = max(freq.values())
+    m = max(freq.values())
     for w in list(freq.keys()):
-        freq[w] = freq[w] / max_f
-
-    # sentence scores
+        freq[w] = freq[w] / m
+    # score sentences
     scored = []
     for idx, s in enumerate(sents):
-        tokens = word_tokens(s)
-        if not tokens:
+        toks = word_tokens(s)
+        if not toks:
             continue
-        # base score: sum of token frequencies
-        score = sum(freq.get(t, 0) for t in tokens)
-        # length regularization (prefer ~12-35 words)
-        length = max(1, len(tokens))
+        length = max(1, len(toks))
         ideal = 24
         length_penalty = 1.0 - min(0.6, abs(length - ideal) / float(ideal + 1))
-        score *= (0.4 + 0.6 * length_penalty)
+        score = sum(freq.get(t, 0) for t in toks) * (0.4 + 0.6 * length_penalty)
         scored.append((idx, s, score))
-
-    # pick top sentences by score
     top = sorted(scored, key=lambda x: x[2], reverse=True)[:max_sentences]
     top_sorted = [t[1] for t in sorted(top, key=lambda x: x[0])]
     return " ".join(top_sorted).strip()
@@ -125,7 +105,7 @@ def find_requirements(text: str):
         if not l_clean:
             continue
         if re.match(r"^(\*|-|•|\d+\.)\s+", l_clean) or len(l_clean) < 220:
-            if re.search(r"\b(must|required?|need to|provide|eligib|documentation|proof|return)\b", l_clean, re.I):
+            if re.search(r"\b(must|required?|need to|provide|eligib|documentation|proof|return|submit)\b", l_clean, re.I):
                 req_lines.append(re.sub(r"^(\*|-|•|\d+\.)\s*", "", l_clean))
     seen = set()
     out = []
@@ -134,7 +114,7 @@ def find_requirements(text: str):
         if k not in seen:
             seen.add(k)
             out.append(x)
-    return out[:10]
+    return out[:12]
 
 def find_key_points(text: str, top_n: int = 6):
     candidates = []
@@ -151,25 +131,47 @@ def find_key_points(text: str, top_n: int = 6):
             out.append(c)
     return out[:top_n]
 
-def propose_next_steps(reqs, deadlines):
-    steps = []
-    if deadlines[1]:
-        steps.append(f"Add key date(s) to calendar: {', '.join(deadlines[1][:3])}.")
-    if reqs:
-        steps.append("Gather required documents/items listed above and upload 48 hours before the deadline.")
-    steps.extend([
-        "Email teacher/admin with any clarifying questions (limit to 3 bullets).",
-        "Confirm submission method (portal, email, or printed copy) and save the confirmation.",
-        "Schedule a 15-minute review with your child/team to align on what success looks like."
-    ])
+# ------------------ Skills mapping ------------------
+# Map common keywords → normalized skill labels (tweak to your niches)
+SKILL_DICTIONARY = {
+    # edu/family comms
+    r"\bimmuni[sz]ation|vaccine\b": "Health Documentation",
+    r"\bconsent form|permission slip\b": "Consent & Forms",
+    r"\btransportation request|bus route\b": "Logistics Coordination",
+    r"\bdevice return|chromebook|laptop\b": "Device Management",
+    r"\bparent[- ]teacher conference|ptc\b": "Scheduling & Coordination",
+    r"\bworkshop|training session\b": "Workshop Participation",
+    r"\bapplication\b": "Application Submission",
+    r"\bdeadline|submit by|due\b": "Deadline Management",
+    # general/enterprise
+    r"\brfp|proposal|brief\b": "RFP Review",
+    r"\brequirements?|eligib(ility|le)\b": "Requirements Compliance",
+    r"\bpolicy|guideline\b": "Policy Comprehension",
+    r"\bdocumentation|records\b": "Documentation Management",
+    r"\bdata\b": "Data Handling",
+    r"\bsalesforce\b": "Salesforce Literacy",
+    r"\bai|nlp|summari[sz]e?\b": "AI/NLP Literacy",
+}
+
+def extract_skills(text: str, requirements: list[str]) -> list[str]:
+    pool = text + "\n" + "\n".join(requirements or [])
+    found = []
+    for pattern, skill in SKILL_DICTIONARY.items():
+        if re.search(pattern, pool, re.I):
+            found.append(skill)
+    # de-dup, preserve order
     seen = set()
-    final = []
-    for s in steps:
+    out = []
+    for s in found:
         if s not in seen:
             seen.add(s)
-            final.append(s)
-    return final[:5]
+            out.append(s)
+    # ensure at least a few generic skills
+    if not out:
+        out = ["Deadline Management", "Documentation Management", "Policy Comprehension"]
+    return out[:15]
 
+# ------------------ Brief + receipts ------------------
 def make_brief(text: str):
     exec_summary = summarize_text(text, max_sentences=5)
     key_points = find_key_points(text, top_n=6)
@@ -183,6 +185,26 @@ def make_brief(text: str):
         "Requirements": requirements,
         "Next Steps": next_steps
     }
+
+def propose_next_steps(reqs, deadlines):
+    steps = []
+    if deadlines[1]:
+        steps.append(f"Add key date(s) to calendar: {', '.join(deadlines[1][:3])}.")
+    if reqs:
+        steps.append("Gather required documents/items listed above and upload 48 hours before the deadline.")
+    steps.extend([
+        "Email teacher/admin with any clarifying questions (limit to 3 bullets).",
+        "Confirm submission method (portal, email, or printed copy) and save the confirmation.",
+        "Schedule a 15-minute review with your child/team to align on what success looks like."
+    ])
+    # de-dup
+    seen = set()
+    final = []
+    for s in steps:
+        if s not in seen:
+            seen.add(s)
+            final.append(s)
+    return final[:5]
 
 def brief_to_markdown(brief: dict, source_name: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -202,11 +224,38 @@ def brief_to_markdown(brief: dict, source_name: str):
     md.append(f"---\n{BRAND_NOTE}")
     return "\n".join(md)
 
+def make_skills_receipt_row(doc_name, user_name, user_role, user_email, skills_selected, proof_note):
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "document": doc_name,
+        "name": user_name,
+        "role": user_role,
+        "email": user_email,
+        "skills": "; ".join(skills_selected) if skills_selected else "",
+        "proof_note_or_link": proof_note,
+    }
+
+def pack_zip(csv_bytes: bytes, md_bytes: bytes, proof_file) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("skills_receipt.csv", csv_bytes)
+        z.writestr("skills_receipt.md", md_bytes)
+        if proof_file is not None:
+            # include original uploaded proof with its filename
+            z.writestr(f"proof/{proof_file.name}", proof_file.getvalue())
+    buf.seek(0)
+    return buf.read()
+
 # ------------------ UI ------------------
 st.set_page_config(page_title=APP_TITLE, page_icon="📝", layout="centered")
 st.title(APP_TITLE)
 st.caption(BRAND_NOTE)
+
 st.write("Upload a school/work **PDF** or **TXT**. You’ll get a 1-page brief with the main points, deadlines, requirements, and clear next steps.")
+st.markdown(
+    "[📅 Book a discovery call](https://calendly.com/YOUR-CALENDLY/30min) • "
+    "[💼 Connect on LinkedIn](https://www.linkedin.com/in/YOUR-LINKEDIN/)"
+)
 
 uploaded = st.file_uploader("Upload document", type=["pdf", "txt"])
 with_styling = st.toggle("Use condensed layout", value=True)
@@ -220,7 +269,6 @@ if uploaded:
         text = uploaded.read().decode("utf-8", errors="ignore")
     text = clean_text(text)
 
-    # Friendly warning for scanned/short docs
     if not text or len(text.strip()) < 200:
         st.warning("This file looks very short or may be a scanned PDF with no selectable text. Try a text-based PDF or TXT file for best results.")
 
@@ -246,7 +294,6 @@ if uploaded:
         else:
             st.markdown(md)
 
-        # Downloads
         st.download_button(
             "⬇️ Download Brief (Markdown)",
             data=md.encode("utf-8"),
@@ -254,16 +301,103 @@ if uploaded:
             mime="text/markdown"
         )
 
-        receipt = f"""Receipt: Family-Receipt-AI-Summarization
-Source: {uploaded.name}
-Skills: Extractive summarization (freq-based), Heuristic extraction (deadlines/requirements), Stakeholder translation
-Timestamp: {datetime.now().isoformat()}
+        st.markdown("---")
+        st.subheader("Map Required Skills & Log Proof")
+
+        # 1) Extract candidate skills from doc/requirements
+        inferred_skills = extract_skills(text, brief.get("Requirements", []))
+        st.caption("Auto-detected skills (you can edit):")
+        skills_selected = st.multiselect(
+            "Select applicable skills",
+            options=sorted(set(inferred_skills + [
+                # give users extra choices
+                "Communication", "Compliance", "Record-Keeping", "Stakeholder Coordination",
+                "Data Handling", "AI/NLP Literacy", "Requirements Compliance", "Deadline Management"
+            ])),
+            default=inferred_skills
+        )
+
+        custom_skill = st.text_input("Add a custom skill (optional)")
+        if custom_skill:
+            if custom_skill not in skills_selected:
+                skills_selected.append(custom_skill)
+
+        # 2) User info
+        cols = st.columns(3)
+        user_name = cols[0].text_input("Your name")
+        user_role = cols[1].selectbox("Your role", ["Parent", "Teacher", "Student", "Org/Admin", "Other"])
+        user_email = cols[2].text_input("Email (optional)")
+
+        # 3) Proof attachment / link / note
+        proof_file = st.file_uploader("Attach proof (optional): certificate, screenshot, PDF", type=["png","jpg","jpeg","pdf","txt","md"], key="proof")
+        proof_note = st.text_input("Proof note or link (optional)")
+
+        # 4) Generate receipts
+        if st.button("Create Skills Receipt"):
+            if not user_name:
+                st.error("Please enter your name to create a receipt.")
+            else:
+                row = make_skills_receipt_row(
+                    doc_name=uploaded.name,
+                    user_name=user_name,
+                    user_role=user_role,
+                    user_email=user_email,
+                    skills_selected=skills_selected,
+                    proof_note=proof_note
+                )
+                df = pd.DataFrame([row])
+
+                # CSV
+                csv_bytes = df.to_csv(index=False).encode("utf-8")
+
+                # Markdown receipt (human friendly)
+                md_receipt = f"""# Skills Receipt
+- **Timestamp:** {row['timestamp']}
+- **Document:** {row['document']}
+- **Name:** {row['name']}
+- **Role:** {row['role']}
+- **Email:** {row['email'] or '—'}
+- **Skills Mapped:** {row['skills'] or '—'}
+- **Proof Note/Link:** {row['proof_note_or_link'] or '—'}
+
+---
+{BRAND_NOTE}
 """
-        st.download_button(
-            "🧾 Download Skills-First Receipt",
-            data=receipt.encode("utf-8"),
-            file_name=f"{uploaded.name.rsplit('.',1)[0]}_receipt.txt",
-            mime="text/plain"
+                md_receipt_bytes = md_receipt.encode("utf-8")
+
+                st.success("Skills receipt created. Download it below:")
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.download_button(
+                        "⬇️ Download CSV",
+                        data=csv_bytes,
+                        file_name=f"{uploaded.name.rsplit('.',1)[0]}_skills_receipt.csv",
+                        mime="text/csv",
+                    )
+                with c2:
+                    st.download_button(
+                        "⬇️ Download Markdown",
+                        data=md_receipt_bytes,
+                        file_name=f"{uploaded.name.rsplit('.',1)[0]}_skills_receipt.md",
+                        mime="text/markdown",
+                    )
+                with c3:
+                    # ZIP bundle (CSV + MD + proof file if provided)
+                    zip_bytes = pack_zip(csv_bytes, md_receipt_bytes, proof_file)
+                    st.download_button(
+                        "⬇️ Download ZIP (CSV+MD+Proof)",
+                        data=zip_bytes,
+                        file_name=f"{uploaded.name.rsplit('.',1)[0]}_skills_receipt_bundle.zip",
+                        mime="application/zip",
+                    )
+
+        st.markdown("---")
+        st.subheader("Want this automated for your school/org?")
+        st.write("I build custom Skills-First pipelines: doc intake → skills mapping → receipts → dashboards.")
+        st.markdown(
+            "[📅 Book a discovery call](https://calendly.com/bmceachin/30min) • "
+            "[💼 Connect on LinkedIn](https://www.linkedin.com/in/brittanymceachin2010/)"
         )
 else:
     st.info("Tip: Try a school newsletter, IEP update, district announcement, or work RFP to see how it condenses.")
